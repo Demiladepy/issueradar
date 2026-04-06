@@ -1,4 +1,4 @@
-# 📡 IssueRadar
+#  IssueRadar
 
 > **AI-powered GitHub issue triage** — IssueRadar monitors your GitHub Issues, PR comments, and Slack threads, uses Oxlo AI to classify severity, detect duplicates, and auto-draft structured tickets, then sends your team a daily zero-noise digest.
 
