@@ -4,15 +4,23 @@ import type { OxloClient } from '../oxlo/client.js';
 import { analyzeIssue } from '../pipeline.js';
 import { saveAnalysis, getIssueSummaries } from '../storage/db.js';
 import { findSimilarCandidates, buildIndex } from '../storage/embeddings.js';
+import {
+  normalizeGitHubIssue,
+  normalizeGitHubPRComment,
+  isAnalyzableIssue,
+} from '../normalizer.js';
 import { labelIssue, postAnalysisComment } from './issues.js';
 import { suggestAssignee } from './blame.js';
+import { createLogger } from '../utils/logger.js';
 
-/** GitHub webhook event types we handle. */
-type GitHubIssueAction = 'opened' | 'edited' | 'reopened';
-type GitHubPRCommentAction = 'created';
+const log = createLogger('webhook');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GitHub webhook payload shapes
+// ─────────────────────────────────────────────────────────────────────────────
 
 interface GitHubIssuePayload {
-  action: GitHubIssueAction;
+  action: string;
   issue: {
     number: number;
     title: string;
@@ -22,41 +30,36 @@ interface GitHubIssuePayload {
   };
   repository: {
     full_name: string;
-    default_branch: string;
   };
-  installation?: {
-    id: number;
-  };
+  installation?: { id: number };
 }
 
-interface GitHubPRCommentPayload {
-  action: GitHubPRCommentAction;
+interface GitHubCommentPayload {
+  action: string;
   comment: {
     id: number;
     body: string;
     html_url: string;
-    user: { login: string };
+    user: { login: string; type: string };
   };
-  pull_request: {
-    number: number;
-    html_url: string;
-  };
+  issue?: { number: number };
+  pull_request?: { number: number };
   repository: {
     full_name: string;
-    default_branch: string;
   };
-  installation?: {
-    id: number;
-  };
+  installation?: { id: number };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Signature verification
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
- * Verifies the GitHub webhook HMAC-SHA256 signature.
+ * Verifies the GitHub webhook HMAC-SHA256 signature in constant time.
  *
- * @param payload   - Raw request body as string
+ * @param payload   - Raw request body string
  * @param signature - Value of the x-hub-signature-256 header
- * @param secret    - Webhook secret configured in GitHub App settings
- * @returns true if signature is valid
+ * @param secret    - Webhook secret from the GitHub App settings
  */
 export function verifyWebhookSignature(
   payload: string,
@@ -71,10 +74,14 @@ export function verifyWebhookSignature(
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Express handler factory
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
- * Express handler for POST /webhook.
- * Verifies GitHub signature, dispatches to the correct handler by event type,
- * and returns 200 immediately — analysis happens asynchronously.
+ * Creates an Express handler for POST /webhook.
+ * Verifies GitHub HMAC signature, acknowledges with 200 immediately,
+ * then processes the event asynchronously.
  *
  * @param client - Initialized OxloClient
  */
@@ -83,7 +90,6 @@ export function createWebhookHandler(client: OxloClient) {
     const rawBody = req.body as string;
     const signature = req.headers['x-hub-signature-256'] as string | undefined;
     const event = req.headers['x-github-event'] as string | undefined;
-
     const webhookSecret = process.env.GITHUB_WEBHOOK_SECRET ?? '';
 
     if (!signature || !verifyWebhookSignature(rawBody, signature, webhookSecret)) {
@@ -91,90 +97,119 @@ export function createWebhookHandler(client: OxloClient) {
       return;
     }
 
-    // Acknowledge immediately — GitHub expects a fast 2xx
+    // Respond immediately — GitHub expects a fast 2xx
     res.status(200).json({ ok: true });
 
-    // Process asynchronously
-    try {
-      const payload = JSON.parse(rawBody) as unknown;
-
-      if (event === 'issues') {
-        await handleIssueEvent(client, payload as GitHubIssuePayload);
-      } else if (event === 'pull_request_review_comment' || event === 'issue_comment') {
-        await handlePRCommentEvent(client, payload as GitHubPRCommentPayload);
-      }
-      // Other event types are silently ignored
-    } catch (err) {
-      console.error('[webhook] Processing error:', err);
-    }
+    void processEvent(client, event, rawBody);
   };
 }
 
-async function handleIssueEvent(
-  client: OxloClient,
-  payload: GitHubIssuePayload
-): Promise<void> {
-  const { action, issue, repository } = payload;
+async function processEvent(client: OxloClient, event: string | undefined, rawBody: string): Promise<void> {
+  try {
+    const payload = JSON.parse(rawBody) as unknown;
 
-  if (!(['opened', 'edited', 'reopened'] as GitHubIssueAction[]).includes(action)) return;
+    if (event === 'issues') {
+      await handleIssueEvent(client, payload as GitHubIssuePayload);
+    } else if (event === 'issue_comment' || event === 'pull_request_review_comment') {
+      await handleCommentEvent(client, payload as GitHubCommentPayload);
+    }
+  } catch (err) {
+    log.error(`Event processing failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
-  // Skip if already labeled by IssueRadar
-  if (issue.labels.some((l) => l.name.startsWith('severity/'))) return;
+// ─────────────────────────────────────────────────────────────────────────────
+// Event handlers
+// ─────────────────────────────────────────────────────────────────────────────
 
-  const text = `${issue.title}\n\n${issue.body ?? ''}`.trim();
-  if (!text) return;
+async function handleIssueEvent(client: OxloClient, payload: GitHubIssuePayload): Promise<void> {
+  const { action, issue, repository, installation } = payload;
 
-  console.info(`[webhook] Analyzing issue #${issue.number} in ${repository.full_name}`);
+  if (!['opened', 'edited', 'reopened'].includes(action)) return;
+
+  // Skip already-processed issues
+  if (issue.labels.some((l) => l.name === 'issueradar')) return;
+
+  if (!isAnalyzableIssue(issue.title, issue.body)) {
+    log.dim(`Skipping issue #${issue.number} — not analyzable`);
+    return;
+  }
+
+  const [owner, repo] = repository.full_name.split('/') as [string, string];
+  const item = normalizeGitHubIssue(
+    repository.full_name,
+    issue.number,
+    issue.title,
+    issue.body,
+    issue.html_url
+  );
+
+  log.info(`Processing issue #${issue.number} in ${repository.full_name}`);
 
   const summaries = getIssueSummaries(50);
-  const candidates = findSimilarCandidates(text, buildIndex(summaries));
+  const candidates = findSimilarCandidates(item.text, buildIndex(summaries));
 
   const { result } = await analyzeIssue(client, {
-    text,
-    source: 'github_issue',
-    sourceId: `${repository.full_name}#${issue.number}`,
-    sourceUrl: issue.html_url,
+    text: item.text,
+    source: item.source,
+    sourceId: item.sourceId,
+    sourceUrl: item.sourceUrl,
     existingIssues: candidates,
   });
 
-  saveAnalysis(text, result);
+  saveAnalysis(item.text, result);
 
-  const [repoOwner, repoName] = repository.full_name.split('/');
-
-  await Promise.all([
-    labelIssue(repoOwner, repoName, issue.number, result.severity.label, result.classification.type),
-    postAnalysisComment(repoOwner, repoName, issue.number, result, await suggestAssignee(repoOwner, repoName, result.extracted.affectedModule)),
+  // Run blame and label+comment concurrently
+  const installationId = installation?.id;
+  const [suggestedLogin] = await Promise.all([
+    suggestAssignee(owner, repo, result.extracted.affectedModule, installationId),
+    labelIssue(owner, repo, issue.number, result.severity.label, result.classification.type, installationId),
   ]);
+
+  await postAnalysisComment(owner, repo, issue.number, result, suggestedLogin, installationId);
+
+  log.success(
+    `#${issue.number} → ${result.classification.type} severity=${result.severity.score}/5` +
+      (result.deduplication.duplicateIds.length > 0 ? ' [duplicate detected]' : '')
+  );
 }
 
-async function handlePRCommentEvent(
-  client: OxloClient,
-  payload: GitHubPRCommentPayload
-): Promise<void> {
+async function handleCommentEvent(client: OxloClient, payload: GitHubCommentPayload): Promise<void> {
   const { action, comment, repository } = payload;
   if (action !== 'created') return;
 
-  // Only analyze comments that look like bug reports (keyword filter to reduce noise)
-  const bugKeywords = /\b(bug|broken|crash|error|exception|fail|issue|problem|regression)\b/i;
-  if (!bugKeywords.test(comment.body)) return;
+  // Skip bot comments to prevent feedback loops
+  if (comment.user.type === 'Bot') return;
 
-  console.info(`[webhook] Analyzing PR comment in ${repository.full_name}`);
+  // Skip short or irrelevant comments
+  if (!isAnalyzableIssue('', comment.body) || comment.body.length < 50) return;
 
-  const text = comment.body;
+  const BUG_SIGNAL = /\b(bug|broken|crash|error|exception|fail|regression|not working)\b/i;
+  if (!BUG_SIGNAL.test(comment.body)) return;
+
+  const item = normalizeGitHubPRComment(
+    repository.full_name,
+    payload.pull_request?.number ?? payload.issue?.number ?? 0,
+    comment.id,
+    comment.body,
+    comment.html_url
+  );
+
+  log.info(`Processing PR comment in ${repository.full_name}`);
+
   const summaries = getIssueSummaries(50);
-  const candidates = findSimilarCandidates(text, buildIndex(summaries));
+  const candidates = findSimilarCandidates(item.text, buildIndex(summaries));
 
   const { result } = await analyzeIssue(client, {
-    text,
-    source: 'github_pr_comment',
-    sourceId: `${repository.full_name}#comment-${comment.id}`,
-    sourceUrl: comment.html_url,
+    text: item.text,
+    source: item.source,
+    sourceId: item.sourceId,
+    sourceUrl: item.sourceUrl,
     existingIssues: candidates,
   });
 
-  // Only save bugs from PR comments — noise/questions are expected in PRs
   if (result.classification.type === 'bug') {
-    saveAnalysis(text, result);
-    console.info(`[webhook] Bug detected in PR comment, severity ${result.severity.score}/5`);
+    saveAnalysis(item.text, result);
+    log.success(`Bug in PR comment captured — severity ${result.severity.score}/5`);
   }
 }

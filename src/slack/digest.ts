@@ -1,5 +1,5 @@
 import type { WebClient } from '@slack/web-api';
-import type { StoredIssue } from '../storage/db.js';
+import type { StoredIssue, WeeklyTrend } from '../storage/db.js';
 import { saveDigest } from '../storage/db.js';
 
 /** Groups issues by severity score for digest formatting. */
@@ -34,11 +34,13 @@ export function groupIssuesForDigest(issues: StoredIssue[]): DigestGroups {
  *
  * @param groups - Issues grouped by severity
  * @param date   - The date string for the digest header (e.g. "2026-04-06")
+ * @param trend  - Optional week-over-week trend data for the summary line
  * @returns Slack Block Kit blocks array
  */
 export function renderDigestBlocks(
   groups: DigestGroups,
-  date: string
+  date: string,
+  trend?: WeeklyTrend
 ): Array<Record<string, unknown>> {
   const totalBugs = groups.critical.length + groups.high.length + groups.medium.length + groups.low.length;
   const blocks: Array<Record<string, unknown>> = [];
@@ -48,11 +50,19 @@ export function renderDigestBlocks(
     text: { type: 'plain_text', text: `📡 IssueRadar Daily Digest — ${date}`, emoji: true },
   });
 
+  // Trend arrow: ↑ means more bugs this week (bad), ↓ means fewer (good)
+  let trendText = '';
+  if (trend && (trend.lastWeekBugs > 0 || trend.thisWeekBugs > 0)) {
+    const arrow = trend.bugDelta > 0 ? '↑' : trend.bugDelta < 0 ? '↓' : '→';
+    const color = trend.bugDelta > 0 ? '🔴' : trend.bugDelta < 0 ? '🟢' : '⚪';
+    trendText = `  ${color} ${arrow}${Math.abs(trend.bugDelta)} vs last week`;
+  }
+
   blocks.push({
     type: 'section',
     text: {
       type: 'mrkdwn',
-      text: `*${totalBugs} bugs* · *${groups.features.length} features* · *${groups.duplicates.length} duplicates caught*`,
+      text: `*${totalBugs} bugs* · *${groups.features.length} features* · *${groups.duplicates.length} duplicates caught*${trendText}`,
     },
   });
 
@@ -163,11 +173,13 @@ function renderIssueBlock(
  * @param slack   - Slack WebClient instance
  * @param issues  - All issues processed today
  * @param channel - Slack channel ID to post to
+ * @param trend   - Optional week-over-week trend data
  */
 export async function postDailyDigest(
   slack: WebClient,
   issues: StoredIssue[],
-  channel: string
+  channel: string,
+  trend?: WeeklyTrend
 ): Promise<void> {
   const date = new Date().toISOString().slice(0, 10);
 
@@ -181,7 +193,7 @@ export async function postDailyDigest(
   }
 
   const groups = groupIssuesForDigest(issues);
-  const blocks = renderDigestBlocks(groups, date);
+  const blocks = renderDigestBlocks(groups, date, trend);
 
   await slack.chat.postMessage({
     channel,

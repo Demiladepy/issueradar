@@ -4,21 +4,23 @@ import type { OxloClient } from '../oxlo/client.js';
 import { analyzeIssue } from '../pipeline.js';
 import { saveAnalysis, getIssueSummaries } from '../storage/db.js';
 import { findSimilarCandidates, buildIndex } from '../storage/embeddings.js';
+import { normalizeSlackMessage, looksLikeBugReport } from '../normalizer.js';
+import { createLogger } from '../utils/logger.js';
 
-/** Keyword pattern that flags a Slack message as a potential bug report. */
-const BUG_PATTERN =
-  /\b(bug|broken|crash(?:ing|ed)?|error|exception|fail(?:ing|ed|ure)?|issue|problem|regression|not working|doesn['']t work|can['']t|cannot)\b/i;
+const log = createLogger('slack');
 
-/** Minimum message length to analyze (avoids single-word false positives). */
-const MIN_MESSAGE_LENGTH = 30;
+const WORKSPACE_DOMAIN = process.env.SLACK_WORKSPACE_DOMAIN ?? 'your-workspace';
 
 /**
  * Creates and configures the Slack Bolt app.
- * Listens to all messages in configured channels and runs the pipeline
- * on messages that look like bug reports.
+ * Listens to messages in configured channels and runs the 4-call Oxlo pipeline
+ * on any message that looks like a bug report.
  *
- * @param oxloClient - Initialized OxloClient for the pipeline
- * @returns Configured SlackApp instance (not yet started)
+ * Required env vars:
+ *   SLACK_BOT_TOKEN, SLACK_APP_TOKEN, SLACK_SIGNING_SECRET, SLACK_CHANNEL_IDS
+ *
+ * @param oxloClient - Initialized OxloClient
+ * @returns Configured Slack app (not yet started — call app.start() separately)
  */
 export function createSlackApp(oxloClient: OxloClient): SlackApp {
   const app = new SlackApp({
@@ -29,76 +31,63 @@ export function createSlackApp(oxloClient: OxloClient): SlackApp {
   });
 
   const watchedChannels = new Set(
-    (process.env.SLACK_CHANNEL_IDS ?? '').split(',').map((c) => c.trim()).filter(Boolean)
+    (process.env.SLACK_CHANNEL_IDS ?? '')
+      .split(',')
+      .map((c) => c.trim())
+      .filter(Boolean)
   );
 
-  // Listen to all messages (will filter by channel below)
-  app.message(async ({ message, client }) => {
+  app.message(async ({ message }) => {
     const msg = message as GenericMessageEvent;
 
-    // Only process messages from configured channels
     if (!watchedChannels.has(msg.channel)) return;
-
-    // Skip bot messages to avoid feedback loops
     if (msg.subtype === 'bot_message') return;
 
     const text = msg.text ?? '';
-    if (text.length < MIN_MESSAGE_LENGTH) return;
-    if (!BUG_PATTERN.test(text)) return;
+    if (!looksLikeBugReport(text)) return;
 
-    console.info(`[slack] Analyzing message in channel ${msg.channel}`);
+    log.info(`Bug signal in channel ${msg.channel} — analyzing`);
 
     try {
-      await processSlackMessage(oxloClient, client, msg, text);
+      const item = normalizeSlackMessage(msg.channel, msg.ts, text, WORKSPACE_DOMAIN);
+
+      const summaries = getIssueSummaries(50);
+      const candidates = findSimilarCandidates(item.text, buildIndex(summaries));
+
+      const { result } = await analyzeIssue(oxloClient, {
+        text: item.text,
+        source: item.source,
+        sourceId: item.sourceId,
+        sourceUrl: item.sourceUrl,
+        existingIssues: candidates,
+      });
+
+      // Only persist bugs — questions and noise are expected in Slack
+      if (result.classification.type !== 'bug') {
+        log.dim(`Skipping non-bug message (type=${result.classification.type})`);
+        return;
+      }
+
+      saveAnalysis(item.text, result);
+
+      log.success(
+        `Bug captured: "${result.extracted.title}" ` +
+          `severity=${result.severity.score}/5` +
+          (result.deduplication.duplicateIds.length > 0 ? ' [possible duplicate]' : '')
+      );
     } catch (err) {
-      console.error('[slack] Failed to analyze message:', err);
+      log.error(`Failed to analyze message: ${err instanceof Error ? err.message : String(err)}`);
     }
   });
 
   return app;
 }
 
-async function processSlackMessage(
-  oxloClient: OxloClient,
-  _slackClient: WebClient,
-  msg: GenericMessageEvent,
-  text: string
-): Promise<void> {
-  const summaries = getIssueSummaries(50);
-  const candidates = findSimilarCandidates(text, buildIndex(summaries));
-
-  const messageUrl = buildSlackMessageUrl(msg.channel, msg.ts);
-
-  const { result } = await analyzeIssue(oxloClient, {
-    text,
-    source: 'slack',
-    sourceId: `${msg.channel}-${msg.ts}`,
-    sourceUrl: messageUrl,
-    existingIssues: candidates,
-  });
-
-  // Only persist bugs from Slack — questions and noise are expected
-  if (result.classification.type !== 'bug') return;
-
-  saveAnalysis(text, result);
-
-  console.info(
-    `[slack] Bug captured from Slack: "${result.extracted.title}" severity ${result.severity.score}/5`
-  );
-}
-
-function buildSlackMessageUrl(channel: string, ts: string): string {
-  const workspaceDomain = process.env.SLACK_WORKSPACE_DOMAIN ?? 'your-workspace';
-  const tsForUrl = ts.replace('.', '');
-  return `https://${workspaceDomain}.slack.com/archives/${channel}/p${tsForUrl}`;
-}
-
 /**
- * Returns the WebClient from an initialized Slack app.
- * Used by the digest scheduler to post messages without importing the app instance.
+ * Returns the Slack WebClient from a running app instance.
+ * Used by the scheduler to post digest messages without importing the full app.
  *
  * @param app - Running SlackApp instance
- * @returns The underlying WebClient
  */
 export function getSlackClient(app: SlackApp): WebClient {
   return app.client;

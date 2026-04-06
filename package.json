@@ -16,6 +16,7 @@
     "scan": "tsx src/cli/index.ts scan",
     "digest": "tsx src/cli/index.ts digest",
     "stats": "tsx src/cli/index.ts stats",
+    "test:webhook": "tsx src/cli/test-webhook.ts",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write \"src/**/*.ts\"",
     "format:check": "prettier --check \"src/**/*.ts\""

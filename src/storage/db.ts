@@ -280,6 +280,56 @@ export function getTodaysIssues(): StoredIssue[] {
   return rows.map(rowToStoredIssue);
 }
 
+/** Week-over-week trend data for the digest header. */
+export interface WeeklyTrend {
+  thisWeekBugs: number;
+  lastWeekBugs: number;
+  thisWeekDupes: number;
+  lastWeekDupes: number;
+  /** Positive means more bugs this week than last (bad). Negative means fewer (good). */
+  bugDelta: number;
+}
+
+/**
+ * Returns bug and duplicate counts for this week vs last week.
+ * Used to show trend arrows in the daily digest.
+ */
+export function getWeeklyTrend(): WeeklyTrend {
+  const db = getDb();
+
+  const thisWeekBugs = (db.prepare(
+    `SELECT COUNT(*) as count FROM processed_issues
+     WHERE type = 'bug' AND created_at >= datetime('now', '-7 days')`
+  ).get() as { count: number }).count;
+
+  const lastWeekBugs = (db.prepare(
+    `SELECT COUNT(*) as count FROM processed_issues
+     WHERE type = 'bug'
+       AND created_at >= datetime('now', '-14 days')
+       AND created_at < datetime('now', '-7 days')`
+  ).get() as { count: number }).count;
+
+  const thisWeekDupes = (db.prepare(
+    `SELECT COUNT(*) as count FROM processed_issues
+     WHERE duplicate_ids != '[]' AND created_at >= datetime('now', '-7 days')`
+  ).get() as { count: number }).count;
+
+  const lastWeekDupes = (db.prepare(
+    `SELECT COUNT(*) as count FROM processed_issues
+     WHERE duplicate_ids != '[]'
+       AND created_at >= datetime('now', '-14 days')
+       AND created_at < datetime('now', '-7 days')`
+  ).get() as { count: number }).count;
+
+  return {
+    thisWeekBugs,
+    lastWeekBugs,
+    thisWeekDupes,
+    lastWeekDupes,
+    bugDelta: thisWeekBugs - lastWeekBugs,
+  };
+}
+
 /** Returns the most recent daily digest, if one exists. */
 export function getLatestDigest(): { date: string; content: string } | null {
   const db = getDb();

@@ -1,15 +1,5 @@
-import { Octokit } from '@octokit/rest';
 import type { AnalysisResult } from '../pipeline.js';
-
-let _octokit: Octokit | null = null;
-
-/** Returns the singleton Octokit instance. */
-function getOctokit(): Octokit {
-  if (!_octokit) {
-    _octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
-  }
-  return _octokit;
-}
+import { getInstallationOctokit } from './app-auth.js';
 
 /** All labels IssueRadar manages. Ensures they exist before applying. */
 const MANAGED_LABELS: Record<string, { color: string; description: string }> = {
@@ -24,15 +14,26 @@ const MANAGED_LABELS: Record<string, { color: string; description: string }> = {
   'issueradar':        { color: '5319E7', description: 'Processed by IssueRadar AI' },
 };
 
+/** Cached set of repos where labels have already been ensured this process lifetime. */
+const labelledRepos = new Set<string>();
+
 /**
  * Ensures all IssueRadar labels exist in the repository, creating missing ones.
+ * Results are cached per repo to avoid redundant API calls.
  *
- * @param owner - Repository owner (org or user)
- * @param repo  - Repository name
+ * @param owner          - Repository owner (org or user)
+ * @param repo           - Repository name
+ * @param installationId - GitHub App installation ID (omit for PAT auth)
  */
-export async function ensureLabels(owner: string, repo: string): Promise<void> {
-  const octokit = getOctokit();
+export async function ensureLabels(
+  owner: string,
+  repo: string,
+  installationId?: number
+): Promise<void> {
+  const key = `${owner}/${repo}`;
+  if (labelledRepos.has(key)) return;
 
+  const octokit = await getInstallationOctokit(installationId);
   const { data: existing } = await octokit.issues.listLabelsForRepo({ owner, repo, per_page: 100 });
   const existingNames = new Set(existing.map((l) => l.name));
 
@@ -43,34 +44,36 @@ export async function ensureLabels(owner: string, repo: string): Promise<void> {
         octokit.issues.createLabel({ owner, repo, name, color, description })
       )
   );
+
+  labelledRepos.add(key);
 }
 
 /**
  * Applies severity and type labels to a GitHub issue, then adds the 'issueradar' marker label.
  *
- * @param owner         - Repository owner
- * @param repo          - Repository name
- * @param issueNumber   - GitHub issue number
- * @param severityLabel - e.g. 'severity/high'
- * @param issueType     - e.g. 'bug'
+ * @param owner          - Repository owner
+ * @param repo           - Repository name
+ * @param issueNumber    - GitHub issue number
+ * @param severityLabel  - e.g. 'severity/high'
+ * @param issueType      - e.g. 'bug'
+ * @param installationId - GitHub App installation ID (omit for PAT auth)
  */
 export async function labelIssue(
   owner: string,
   repo: string,
   issueNumber: number,
   severityLabel: string,
-  issueType: string
+  issueType: string,
+  installationId?: number
 ): Promise<void> {
-  const octokit = getOctokit();
-  await ensureLabels(owner, repo);
-
-  const labels = [severityLabel, `type/${issueType}`, 'issueradar'];
+  const octokit = await getInstallationOctokit(installationId);
+  await ensureLabels(owner, repo, installationId);
 
   await octokit.issues.addLabels({
     owner,
     repo,
     issue_number: issueNumber,
-    labels,
+    labels: [severityLabel, `type/${issueType}`, 'issueradar'],
   });
 }
 
@@ -82,17 +85,20 @@ export async function labelIssue(
  * @param issueNumber    - GitHub issue number
  * @param result         - Full analysis result from the pipeline
  * @param suggestedLogin - Suggested assignee GitHub login (or null)
+ * @param installationId - GitHub App installation ID (omit for PAT auth)
  */
 export async function postAnalysisComment(
   owner: string,
   repo: string,
   issueNumber: number,
   result: AnalysisResult,
-  suggestedLogin: string | null
+  suggestedLogin: string | null,
+  installationId?: number
 ): Promise<void> {
-  const octokit = getOctokit();
+  const octokit = await getInstallationOctokit(installationId);
 
   const severityEmoji = ['', '⬜', '🔵', '🟡', '🟠', '🔴'][result.severity.score] ?? '❓';
+
   const dupeSection =
     result.deduplication.duplicateIds.length > 0
       ? `\n\n### ⚠️ Possible Duplicates\nThis may be a duplicate of: ${result.deduplication.duplicateIds.join(', ')}`
@@ -107,13 +113,16 @@ export async function postAnalysisComment(
     ? `\n\n**Suggested Assignee:** @${suggestedLogin} _(based on recent commits to \`${result.extracted.affectedModule}\`)_`
     : '';
 
+  const versionLine = result.extracted.affectedVersion
+    ? `**Version:** ${result.extracted.affectedVersion}\n`
+    : '';
+
   const body = `### 🤖 IssueRadar Analysis
 
 **Type:** \`${result.classification.type}\` (${Math.round(result.classification.confidence * 100)}% confidence)
 **Severity:** ${severityEmoji} ${result.severity.score}/5 — ${result.severity.reason}
 **Affected Module:** \`${result.extracted.affectedModule || 'unknown'}\`
-${result.extracted.affectedVersion ? `**Version:** ${result.extracted.affectedVersion}` : ''}
-
+${versionLine}
 **Summary:** ${result.extracted.description}
 
 **Expected:** ${result.extracted.expectedBehavior || '_not specified_'}
@@ -133,18 +142,20 @@ _Analyzed by [IssueRadar](https://github.com/your-username/issueradar) via Oxlo 
 
 /**
  * Fetches all open issues from a repository, limited to the most recent N.
- * Used for the daily digest cron job.
+ * Used for the daily digest and batch scan cron jobs.
  *
- * @param owner - Repository owner
- * @param repo  - Repository name
- * @param limit - Maximum issues to return (default 100)
+ * @param owner          - Repository owner
+ * @param repo           - Repository name
+ * @param limit          - Maximum issues to return (default 100)
+ * @param installationId - GitHub App installation ID (omit for PAT auth)
  */
 export async function fetchOpenIssues(
   owner: string,
   repo: string,
-  limit = 100
+  limit = 100,
+  installationId?: number
 ): Promise<Array<{ number: number; title: string; body: string | null; htmlUrl: string }>> {
-  const octokit = getOctokit();
+  const octokit = await getInstallationOctokit(installationId);
 
   const { data } = await octokit.issues.listForRepo({
     owner,
@@ -156,7 +167,7 @@ export async function fetchOpenIssues(
   });
 
   return data
-    .filter((issue) => !('pull_request' in issue)) // exclude PRs
+    .filter((issue) => !('pull_request' in issue))
     .map((issue) => ({
       number: issue.number,
       title: issue.title,

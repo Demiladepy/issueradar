@@ -1,105 +1,113 @@
 import 'dotenv/config';
 import express from 'express';
-import cron from 'node-cron';
 import { OxloClient } from './oxlo/client.js';
 import { createWebhookHandler } from './github/webhook.js';
 import { createSlackApp, getSlackClient } from './slack/listener.js';
-import { postDailyDigest } from './slack/digest.js';
-import { getTodaysIssues, getDashboardStats } from './storage/db.js';
+import { registerScheduledJobs } from './scheduler.js';
+import { getDashboardStats, getTodaysIssues } from './storage/db.js';
+import { createLogger } from './utils/logger.js';
+
+const log = createLogger('server');
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
 const WEBHOOK_PATH = process.env.WEBHOOK_PATH ?? '/webhook';
 const DIGEST_CHANNEL = process.env.DIGEST_SLACK_CHANNEL ?? '';
-const DIGEST_CRON = process.env.DIGEST_CRON ?? '0 9 * * *';
 
 async function main(): Promise<void> {
-  // ── Initialize Oxlo AI client ─────────────────────────────────────────────
+  // ── Oxlo AI client ────────────────────────────────────────────────────────
   const oxloClient = new OxloClient();
-  console.info('[init] OxloClient initialized');
+  log.success('OxloClient initialized');
 
-  // ── Express webhook server ────────────────────────────────────────────────
+  // ── Express server ────────────────────────────────────────────────────────
   const app = express();
 
-  // Parse raw body for webhook signature verification, JSON for all other routes
-  app.use(WEBHOOK_PATH, express.text({ type: '*/*', limit: '1mb' }));
+  // Webhook endpoint: raw body for HMAC verification
+  app.use(WEBHOOK_PATH, express.text({ type: '*/*', limit: '2mb' }));
+  // Everything else: JSON
   app.use(express.json());
 
-  // Health check
+  // ── Routes ────────────────────────────────────────────────────────────────
   app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+    });
   });
 
-  // Stats API — consumed by the Next.js dashboard
+  /** Dashboard stats — consumed by the Next.js web app. */
   app.get('/api/stats', (_req, res) => {
     try {
-      const stats = getDashboardStats();
-      res.json(stats);
+      res.json(getDashboardStats());
     } catch (err) {
-      console.error('/api/stats error:', err);
+      log.error(`/api/stats: ${err instanceof Error ? err.message : String(err)}`);
       res.status(500).json({ error: 'Failed to fetch stats' });
     }
   });
 
-  // Digest API — consumed by the Next.js dashboard
+  /** Today's issues for the digest viewer. */
   app.get('/api/digest/latest', (_req, res) => {
     try {
-      const issues = getTodaysIssues();
-      res.json({ issues });
+      res.json({ issues: getTodaysIssues() });
     } catch (err) {
-      console.error('/api/digest/latest error:', err);
+      log.error(`/api/digest/latest: ${err instanceof Error ? err.message : String(err)}`);
       res.status(500).json({ error: 'Failed to fetch digest' });
     }
   });
 
-  // GitHub webhook
+  /** GitHub webhook. */
   app.post(WEBHOOK_PATH, createWebhookHandler(oxloClient));
 
-  app.listen(PORT, () => {
-    console.info(`[server] Webhook server listening on http://localhost:${PORT}${WEBHOOK_PATH}`);
+  const server = app.listen(PORT, () => {
+    log.success(`Webhook server → http://localhost:${PORT}${WEBHOOK_PATH}`);
   });
 
   // ── Slack app ─────────────────────────────────────────────────────────────
-  let slackApp;
+  let scheduler: { stop: () => void } | null = null;
+  let slackApp: Awaited<ReturnType<typeof createSlackApp>> | null = null;
+
   try {
     slackApp = createSlackApp(oxloClient);
     await slackApp.start();
-    console.info('[slack] Slack Bolt app started');
+    log.success('Slack Bolt app started (Socket Mode)');
+
+    // Register cron jobs only if Slack is available
+    if (DIGEST_CHANNEL) {
+      scheduler = registerScheduledJobs({
+        slack: getSlackClient(slackApp),
+        oxloClient,
+        digestChannel: DIGEST_CHANNEL,
+      });
+    } else {
+      log.warn('DIGEST_SLACK_CHANNEL not set — daily digest disabled');
+    }
   } catch (err) {
-    console.warn('[slack] Failed to start Slack app (check SLACK_* env vars):', err);
-  }
-
-  // ── Daily digest cron ─────────────────────────────────────────────────────
-  if (DIGEST_CHANNEL && slackApp) {
-    const slackClient = getSlackClient(slackApp);
-
-    cron.schedule(DIGEST_CRON, async () => {
-      console.info('[digest] Running daily digest...');
-      try {
-        const issues = getTodaysIssues();
-        await postDailyDigest(slackClient, issues, DIGEST_CHANNEL);
-        console.info(`[digest] Posted ${issues.length} issues to ${DIGEST_CHANNEL}`);
-      } catch (err) {
-        console.error('[digest] Failed to post daily digest:', err);
-      }
-    });
-
-    console.info(`[digest] Daily digest scheduled: ${DIGEST_CRON} → #${DIGEST_CHANNEL}`);
-  } else {
-    console.warn('[digest] Daily digest not configured (missing DIGEST_SLACK_CHANNEL)');
+    log.warn(`Slack unavailable — check SLACK_* env vars: ${err instanceof Error ? err.message : String(err)}`);
+    log.info('Webhook server is still running. Slack features are disabled.');
   }
 
   // ── Graceful shutdown ─────────────────────────────────────────────────────
   const shutdown = async (): Promise<void> => {
-    console.info('[shutdown] Shutting down gracefully...');
+    log.info('Shutting down gracefully...');
+    scheduler?.stop();
     if (slackApp) await slackApp.stop();
-    process.exit(0);
+    server.close(() => {
+      log.info('HTTP server closed');
+      process.exit(0);
+    });
   };
 
   process.on('SIGTERM', () => void shutdown());
   process.on('SIGINT', () => void shutdown());
+
+  // ── Startup summary ───────────────────────────────────────────────────────
+  const stats = getDashboardStats();
+  log.info(
+    `Database: ${stats.totalProcessed} issues processed, ${stats.dupsCaught} dupes caught`
+  );
 }
 
-main().catch((err) => {
+main().catch((err: unknown) => {
   console.error('[fatal] Startup failed:', err);
   process.exit(1);
 });
