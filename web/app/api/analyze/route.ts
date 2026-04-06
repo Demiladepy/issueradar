@@ -1,9 +1,9 @@
 import { type NextRequest } from 'next/server';
-import { OxloClient } from '../../../lib/oxlo-client.js';
-import { classifyIssue } from '../../../lib/classifier.js';
-import { extractIssueFields } from '../../../lib/extractor.js';
-import { scoreIssueSeverity } from '../../../lib/scorer.js';
-import { findDuplicateIssues } from '../../../lib/deduplicator.js';
+import { OxloClient } from '../../../lib/oxlo-client';
+import { classifyIssue } from '../../../lib/classifier';
+import { extractIssueFields } from '../../../lib/extractor';
+import { scoreIssueSeverity } from '../../../lib/scorer';
+import { findDuplicateIssues } from '../../../lib/deduplicator';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;

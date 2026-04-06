@@ -1,4 +1,5 @@
 import axios, { type AxiosInstance } from 'axios';
+import { withRetry, isTransientError } from '../utils/retry.js';
 
 /** A single message in a chat conversation. */
 export interface Message {
@@ -62,11 +63,15 @@ export class OxloClient {
       ? [{ role: 'system', content: system }, ...messages]
       : messages;
 
-    const response = await this.http.post<ChatCompletionResponse>('/chat/completions', {
-      model: this.model,
-      messages: allMessages,
-      temperature: 0.2,
-    });
+    const response = await withRetry(
+      () =>
+        this.http.post<ChatCompletionResponse>('/chat/completions', {
+          model: this.model,
+          messages: allMessages,
+          temperature: 0.2,
+        }),
+      { maxAttempts: 3, initialDelayMs: 600, retryIf: isTransientError }
+    );
 
     const content = response.data.choices[0]?.message?.content;
     if (!content) {
